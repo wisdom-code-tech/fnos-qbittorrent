@@ -33,6 +33,7 @@ import traceback
 import json
 import logging
 from http.client import HTTPConnection
+from urllib.parse import parse_qs, urlsplit
 from collections import OrderedDict
 
 # 懒加载模块：仅在需要时才导入
@@ -71,7 +72,7 @@ def _get_brotli():
 # ---------------------------------------------------------------------------
 # 编译好的正则（模块级，避免运行时反复编译）
 # ---------------------------------------------------------------------------
-_RE_CONFIG_PORT = re.compile(r'^WebUI\\Port=(\d+)', re.MULTILINE)
+_RE_CONFIG_PORT = re.compile(r'^WebUI\\Port=(\d+)\s*$', re.MULTILINE)
 _RE_REFERER = re.compile(r'^https?://[^/]+')
 _RE_HTML_ATTR = re.compile(rb'(src|href|action)=([\'"])/(?!/?(?:app|cgi)/)')
 _RE_SAME_COOKIE_ATTR = re.compile(r';\s*[Ss]ame[Ss]ite\s*=\s*[^;\s]+')
@@ -1064,32 +1065,43 @@ class ConnectionPool:
         self._timeout = timeout
         _q = _get_queue()
         self._pool = _q.Queue(maxsize)
+        self._lock = threading.Lock()
 
-    def acquire(self):
-        """从池中取一个连接，没有则新建。"""
+    def acquire(self, port=None):
+        """端口切换与取连接在同一锁内完成，避免并发请求串用端口。"""
         _q = _get_queue()
-        try:
-            conn = self._pool.get_nowait()
-            if conn.sock is not None:
+        with self._lock:
+            if port is not None and port != self._port:
+                self._port = port
+                self._close_all_locked()
+            while True:
                 try:
-                    conn.sock.getpeername()
-                    return conn
-                except (OSError, AttributeError):
-                    pass
-            conn.close()
-        except _q.Empty:
-            pass
-        return HTTPConnection(self._host, self._port, timeout=self._timeout)
+                    conn = self._pool.get_nowait()
+                except _q.Empty:
+                    return HTTPConnection(self._host, self._port, timeout=self._timeout)
+                if conn.port == self._port and conn.sock is not None:
+                    try:
+                        # 空闲连接可读表示 EOF 或有未消费数据，均不宜复用。
+                        readable, _, _ = select.select([conn.sock], [], [], 0)
+                        if not readable:
+                            return conn
+                    except (OSError, ValueError):
+                        pass
+                conn.close()
 
     def release(self, conn):
-        """归还连接，池满则关闭。"""
+        """不归还已关闭连接或切换端口前尚在处理的旧连接。"""
         _q = _get_queue()
-        try:
-            self._pool.put_nowait(conn)
-        except _q.Full:
-            conn.close()
+        with self._lock:
+            if conn.sock is None or conn.port != self._port:
+                conn.close()
+                return
+            try:
+                self._pool.put_nowait(conn)
+            except _q.Full:
+                conn.close()
 
-    def close_all(self):
+    def _close_all_locked(self):
         _q = _get_queue()
         while True:
             try:
@@ -1097,11 +1109,15 @@ class ConnectionPool:
             except _q.Empty:
                 break
 
+    def close_all(self):
+        with self._lock:
+            self._close_all_locked()
+
     def ensure_port(self, port):
-        """动态端口发现：端口变化时清空池内旧端口连接并切换目标端口。"""
-        if port != self._port:
-            self._port = port
-            self.close_all()
+        with self._lock:
+            if port != self._port:
+                self._port = port
+                self._close_all_locked()
 
 
 # ---------------------------------------------------------------------------
@@ -1463,23 +1479,41 @@ def rewrite_html(data):
 # 动态端口发现
 # ---------------------------------------------------------------------------
 _current_port = INITIAL_PORT
-_port_check_time = 0
+_config_port = None
 _port_lock = threading.Lock()
 
 
-def get_target_port():
-    global _current_port, _port_check_time
+def _valid_port(value):
+    return type(value) is int and 1 <= value <= 65535
+
+
+def _set_target_port(port):
+    global _current_port
+    if not _valid_port(port):
+        return
     with _port_lock:
-        now = time.time()
-        if CONFIG_PATH and (now - _port_check_time) > 5:
-            _port_check_time = now
+        if port != _current_port:
+            logging.info("WebUI upstream port changed: %d -> %d", _current_port, port)
+            _current_port = port
+
+
+def get_target_port():
+    global _current_port, _config_port
+    with _port_lock:
+        # 每次请求读取，消除原有 5 秒盲区。只在磁盘端口值发生变化时更新，
+        # 防止尚未落盘的旧值覆盖 setPreferences 已成功接受的新端口。
+        if CONFIG_PATH:
             try:
                 with open(CONFIG_PATH, 'r') as f:
                     m = _RE_CONFIG_PORT.search(f.read())
-                    if m:
-                        _current_port = int(m.group(1))
-            except Exception as e:
-                logging.warning("read config port failed: %s", e)
+                port = int(m.group(1)) if m else None
+                if _valid_port(port) and port != _config_port:
+                    _config_port = port
+                    if port != _current_port:
+                        logging.info("WebUI upstream port changed: %d -> %d", _current_port, port)
+                        _current_port = port
+            except (OSError, ValueError) as e:
+                logging.debug("read config port failed: %s", e)
         return _current_port
 
 
@@ -2012,6 +2046,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         return False
 
     def do_request(self):
+        try:
+            self._do_request()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # 浏览器取消请求或网关断开连接，不再向同一连接发送错误响应。
+            self.close_connection = True
+            logging.debug("downstream disconnected: %s %s", self.command, self.path)
+
+    def _do_request(self):
         # /prefix → /prefix/ 重定向
         if self.path == PREFIX:
             self.send_response(301)
@@ -2049,13 +2091,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         is_head = self.command == "HEAD"
         port = get_target_port()
         pool = ProxyHandler._conn_pool
-
-        # 从连接池获取连接（端口变化时先切换池目标，避免打到旧端口）
-        if pool:
-            pool.ensure_port(port)
-            conn = pool.acquire()
-        else:
-            conn = HTTPConnection(TARGET_HOST, port, timeout=30)
 
         # 构造转发请求头
         headers = {}
@@ -2123,10 +2158,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     self.send_header("Content-Length", str(len(c_body)))
                     self.end_headers()
-                if pool:
-                    pool.release(conn)
-                else:
-                    conn.close()
                 return
 
         # HTML 首页缓存命中检查（注入后的完整 HTML）
@@ -2153,22 +2184,39 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 else:
                     self.send_header("Content-Length", str(len(cached_html)))
                     self.end_headers()
-                if pool:
-                    pool.release(conn)
-                else:
-                    conn.close()
                 return
+
+        # 只在缓存未命中时获取后端连接。
+        conn = pool.acquire(port) if pool else HTTPConnection(TARGET_HOST, port, timeout=30)
+        requested_port = None
+        if self.command == "POST" and urlsplit(path).path == "/api/v2/app/setPreferences" and body:
+            try:
+                prefs = json.loads(parse_qs(body.decode("utf-8"))["json"][0])
+                candidate = prefs.get("web_ui_port")
+                if _valid_port(candidate):
+                    requested_port = candidate
+            except (ValueError, KeyError, TypeError, AttributeError):
+                pass
 
         # 转发请求到后端
         try:
             conn.request(self.command, path, body, headers)
             resp = conn.getresponse()
         except ConnectionError as e:
-            # 连接池可能返回了 half-close 的失效连接（RemoteDisconnected）
-            # 用全新连接重试一次
-            logging.warning("request failed, retry with fresh connection: %s %s -> %s",
-                           self.command, path, e)
+            # 非幂等请求不能自动重放：后端可能已执行操作但响应丢失。
             conn.close()
+            if self.command not in ("GET", "HEAD", "OPTIONS"):
+                logging.error("upstream connection failed: %s %s -> %s", self.command, path, e)
+                self.send_error(502, "Upstream connection closed; request was not replayed")
+                return
+            # 连接刚好过期或后端刚切换端口，刷新目标后用新连接重试一次。
+            port = get_target_port()
+            headers["Host"] = "%s:%d" % (TARGET_HOST, port)
+            headers["Origin"] = "http://%s:%d" % (TARGET_HOST, port)
+            if referer:
+                headers["Referer"] = _RE_REFERER.sub(headers["Origin"], referer)
+            logging.debug("request failed, retry with fresh connection: %s %s -> %s",
+                          self.command, path, e)
             fresh = HTTPConnection(TARGET_HOST, port, timeout=30)
             try:
                 fresh.request(self.command, path, body, headers)
@@ -2177,22 +2225,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e2:
                 logging.error("request failed (after retry): %s %s -> %s",
                               self.command, path, e2)
-                self.send_error(502, str(e2))
                 fresh.close()
+                self.send_error(502, str(e2))
                 return
         except Exception as e:
             logging.error("request failed: %s %s -> %s", self.command, path, e)
+            conn.close()
             self.send_error(502, str(e))
-            if pool:
-                conn.close()  # 出错的连接不归还池
-            else:
-                conn.close()
             return
 
         # 标记后端响应体是否已完整读取：未读完的连接状态不干净，不可归还连接池
         body_done = False
 
         try:
+            if requested_port is not None and 200 <= resp.status < 300:
+                _set_target_port(requested_port)
+                if pool:
+                    pool.ensure_port(requested_port)
             all_resp_headers = resp.getheaders()
             is_html = any(
                 "text/html" in v for k, v in all_resp_headers
@@ -2238,6 +2287,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
             if long_cache:
                 self.send_header("Cache-Control", _LONG_CACHE_VALUE)
+
+            # 204/304 没有消息体，也不能发送 chunked 终止块污染下一个响应。
+            if resp.status in (204, 304):
+                self.end_headers()
+                resp.read()
+                body_done = True
+                return
 
             # 读取并处理响应 body
             if is_html:
@@ -2320,7 +2376,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             self.send_header("Content-Length", "0")
                             self.end_headers()
                         body_done = True
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+            logging.debug("downstream disconnected: %s %s", self.command, self.path)
         except Exception:
+            self.close_connection = True
             logging.error("unhandled in do_request %s %s:\n%s",
                           self.command, path, traceback.format_exc())
         finally:
