@@ -56,14 +56,14 @@ VueTorrent 为默认WebUI，如需切换至原生WebUI请在 qBittorrent 设置�
 - WebSocket Upgrade 透传（原始TCP双向tunnel）
 - 非HTML响应保留gzip压缩透传，HTML响应解压重写
 - WebUI 保存端口成功后立即切换反代目标；配置文件端口变更也会在下一次请求时发现，旧端口连接不再复用
-- 多线程并发处理
+- 有界线程池并发处理；每次响应后释放网关侧连接，避免空闲 keep-alive 连接占满线程，后端 TCP 连接继续复用
 - 统一更新检测脚本注入（`update-check.js`），VueTorrent（构建注入）与原生WebUI（网关注入）共用
 
 ---
 
 ## 网关回归验证
 
-运行 `python3 -m unittest discover -s tests -v`。测试使用本地 HTTP 后端和 Unix socket，覆盖运行中切换 WebUI 端口、配置延迟落盘、旧连接清理、204 响应、客户端取消请求，以及写操作断连后不重复提交。
+运行 `python3 -m unittest discover -s tests -v`。测试使用本地 HTTP 后端和 Unix socket，覆盖超过线程数的连续客户端请求、运行中切换 WebUI 端口、配置延迟落盘、旧连接清理、204 响应、客户端取消请求，以及写操作断连后不重复提交。
 
 ---
 

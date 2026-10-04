@@ -112,6 +112,16 @@ class GatewayTests(unittest.TestCase):
         self.write_port(self.old)
         self.assertEqual(self.request(client)[1], str(self.old).encode())
 
+    def test_completed_connections_do_not_exhaust_worker_pool(self):
+        # 保留超过 8 个客户端对象，验证已经完成响应的空闲连接不占线程。
+        for _ in range(12):
+            client = self.client()
+            client.timeout = 1
+            response, payload = self.request(client)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader('Connection'), 'close')
+            self.assertEqual(payload, str(self.old).encode())
+
     def test_external_port_change_has_no_polling_delay(self):
         client = self.client()
         self.request(client)

@@ -1805,6 +1805,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     # 使用 HTTP/1.1：HTTP/1.0 不支持 chunked 编码，
     # 而动态 API 响应（无 Content-Length 时）会走 chunked 转发
     protocol_version = "HTTP/1.1"
+    # 限制网关连接在尚未发送请求时的等待，避免永久占用工作线程。
+    timeout = 15
     # 共享连接池（类级别，所有实例共用）
     _conn_pool = None
 
@@ -2045,7 +2047,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         return False
 
+    def end_headers(self):
+        if getattr(self, "headers", {}).get("Upgrade", "").lower() != "websocket":
+            self.send_header("Connection", "close")
+        super().end_headers()
+
     def do_request(self):
+        # 有界线程池处理的是连接，HTTP keep-alive 会让空闲连接长期占住
+        # 全部线程。每次响应后释放网关侧 Unix 连接；后端 TCP 仍由连接池复用。
+        # WebSocket 的 dup fd 由隧道线程接管，不受此设置影响。
+        self.close_connection = True
         try:
             self._do_request()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -2545,6 +2556,8 @@ class ThreadedUnixHTTPServer(http.server.HTTPServer):
     def _handle(self, request, client_address):
         try:
             self.finish_request(request, client_address)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            logging.debug("gateway connection closed")
         except Exception:
             self.handle_error(request, client_address)
         finally:
